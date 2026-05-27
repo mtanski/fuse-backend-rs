@@ -8,17 +8,18 @@
 //! buffer and the whole reply message must be written all at once.
 
 use std::collections::VecDeque;
+use std::convert::TryFrom;
 use std::io::{self, IoSlice, Write};
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 
 use nix::sys::uio::writev;
 use nix::unistd::write;
 use vm_memory::{ByteValued, VolatileSlice};
 
-use super::{Error, FileReadWriteVolatile, IoBuffers, Reader, Result, Writer};
+use super::{pagesize, Error, FileReadWriteVolatile, IoBuffers, Reader, Result, Writer};
 use crate::file_buf::FileVolatileSlice;
 use crate::BitmapSlice;
 
@@ -83,13 +84,22 @@ impl<'a, S: BitmapSlice + Default> Reader<'a, S> {
 /// 2. If the writer is split, a final commit() MUST be called to issue the
 ///    device write operation.
 /// 3. Concurrency, caller should not write to the writer concurrently.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct FuseDevWriter<'a, S: BitmapSlice = ()> {
     fd: RawFd,
     buffered: bool,
     buf: ManuallyDrop<Vec<u8>>,
+    file_ranges: Vec<FuseFileRange>,
+    file_range_bytes: usize,
     bitmapslice: S,
     phantom: PhantomData<&'a mut [S]>,
+}
+
+#[derive(Debug)]
+struct FuseFileRange {
+    fd: OwnedFd,
+    offset: u64,
+    len: usize,
 }
 
 impl<'a, S: BitmapSlice + Default> FuseDevWriter<'a, S> {
@@ -100,6 +110,8 @@ impl<'a, S: BitmapSlice + Default> FuseDevWriter<'a, S> {
             fd,
             buffered: false,
             buf: ManuallyDrop::new(buf),
+            file_ranges: Vec::new(),
+            file_range_bytes: 0,
             bitmapslice: S::default(),
             phantom: PhantomData,
         })
@@ -134,6 +146,8 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
             fd: self.fd,
             buffered: true,
             buf,
+            file_ranges: Vec::new(),
+            file_range_bytes: 0,
             bitmapslice: self.bitmapslice.clone(),
             phantom: PhantomData,
         })
@@ -145,10 +159,25 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
             return Ok(0);
         }
 
-        let o = match other {
-            Some(Writer::FuseDev(w)) => w.buf.as_slice(),
-            _ => &[],
+        let (o, o_file_ranges) = match other {
+            Some(Writer::FuseDev(w)) => (w.buf.as_slice(), w.file_ranges.as_slice()),
+            _ => (&[][..], &[][..]),
         };
+
+        if !self.file_ranges.is_empty() || !o_file_ranges.is_empty() {
+            let res = commit_with_file_ranges(
+                self.fd,
+                &[self.buf.as_slice(), o],
+                &[self.file_ranges.as_slice(), o_file_ranges],
+            );
+            return match res {
+                Ok(Some(count)) => Ok(count),
+                Ok(None) => self.commit_copying_file_ranges(o, o_file_ranges),
+                Err(err) if err.kind() == io::ErrorKind::WriteZero => Err(err),
+                Err(_) => self.commit_copying_file_ranges(o, o_file_ranges),
+            };
+        }
+
         let res = match (self.buf.len(), o.len()) {
             (0, 0) => Ok(0),
             (0, _) => write(self.fd, o),
@@ -164,18 +193,33 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
 
     /// Return number of bytes already written to the internal buffer.
     pub fn bytes_written(&self) -> usize {
-        self.buf.len()
+        self.buf.len() + self.file_range_bytes
     }
 
     /// Return number of bytes available for writing.
     pub fn available_bytes(&self) -> usize {
-        self.buf.capacity() - self.buf.len()
+        self.buf.capacity() - self.bytes_written()
     }
 
-    fn account_written(&mut self, count: usize) {
+    fn account_buffer_written(&mut self, count: usize) {
         let new_len = self.buf.len() + count;
         // Safe because check_avail_space() ensures that `count` is valid.
         unsafe { self.buf.set_len(new_len) };
+    }
+
+    fn account_file_range_written(&mut self, count: usize) {
+        self.file_range_bytes += count;
+    }
+
+    fn check_no_file_ranges(&self) -> io::Result<()> {
+        if self.file_range_bytes == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot append buffered bytes after fd-backed FUSE reply ranges",
+            ))
+        }
     }
 
     /// Write an object to the writer.
@@ -192,6 +236,7 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
         count: usize,
     ) -> io::Result<usize> {
         self.check_available_space(count)?;
+        self.check_no_file_ranges()?;
 
         let cnt = src.read_vectored_volatile(
             // Safe because we have made sure buf has at least count capacity above
@@ -202,7 +247,7 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
                 )]
             },
         )?;
-        self.account_written(cnt);
+        self.account_buffer_written(cnt);
 
         if self.buffered {
             Ok(cnt)
@@ -220,6 +265,7 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
         off: u64,
     ) -> io::Result<usize> {
         self.check_available_space(count)?;
+        self.check_no_file_ranges()?;
 
         let cnt = src.read_vectored_at_volatile(
             // Safe because we have made sure buf has at least count capacity above
@@ -231,13 +277,46 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
             },
             off,
         )?;
-        self.account_written(cnt);
+        self.account_buffer_written(cnt);
 
         if self.buffered {
             Ok(cnt)
         } else {
             Self::do_write(self.fd, &self.buf[..cnt])
         }
+    }
+
+    /// Record an fd-backed file range for the final FUSE reply.
+    ///
+    /// When the writer is buffered, the range is retained as an open fd and committed through the
+    /// Linux pipe/splice path. This is the fast path used by read replies after the server has
+    /// split the reply writer into a header writer and a data writer. If the writer is not
+    /// buffered, fall back to the existing copy path because a `/dev/fuse` reply still needs the
+    /// out header and payload to be sent as one complete message.
+    pub fn write_from_fd_at(&mut self, fd: RawFd, count: usize, off: u64) -> io::Result<usize> {
+        self.check_available_space(count)?;
+
+        if !self.buffered {
+            let dup_fd = unsafe { libc::dup(fd) };
+            if dup_fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
+            return self.write_from_at(file, count, off);
+        }
+
+        let dup_fd = unsafe { libc::dup(fd) };
+        if dup_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let owned = unsafe { OwnedFd::from_raw_fd(dup_fd) };
+        self.file_ranges.push(FuseFileRange {
+            fd: owned,
+            offset: off,
+            len: count,
+        });
+        self.account_file_range_written(count);
+        Ok(count)
     }
 
     /// Write all data to the writer from a file descriptor.
@@ -287,6 +366,210 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
             io::Error::other(format!("{e}"))
         })
     }
+
+    fn commit_copying_file_ranges(
+        &mut self,
+        other_buf: &[u8],
+        other_ranges: &[FuseFileRange],
+    ) -> io::Result<usize> {
+        let mut output = Vec::with_capacity(
+            self.buf.len()
+                + other_buf.len()
+                + self
+                    .file_ranges
+                    .iter()
+                    .chain(other_ranges.iter())
+                    .map(|range| range.len)
+                    .sum::<usize>(),
+        );
+        output.extend_from_slice(self.buf.as_slice());
+        output.extend_from_slice(other_buf);
+        for range in self.file_ranges.iter().chain(other_ranges.iter()) {
+            read_file_range_copy(range, &mut output)?;
+        }
+        write(self.fd, &output).map_err(|e| io::Error::from_raw_os_error(e as i32))
+    }
+}
+
+fn commit_with_file_ranges(
+    fuse_fd: RawFd,
+    buffers: &[&[u8]],
+    range_groups: &[&[FuseFileRange]],
+) -> io::Result<Option<usize>> {
+    let total_len = buffers.iter().map(|buf| buf.len()).sum::<usize>()
+        + range_groups
+            .iter()
+            .flat_map(|group| group.iter())
+            .map(|range| range.len)
+            .sum::<usize>();
+    if total_len == 0 {
+        return Ok(Some(0));
+    }
+    let file_range_bytes = range_groups
+        .iter()
+        .flat_map(|group| group.iter())
+        .map(|range| range.len)
+        .sum::<usize>();
+    if file_range_bytes < 2 * pagesize() {
+        return Ok(None);
+    }
+
+    let mut pipe_fds = [-1; 2];
+    let pipe_result = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    if pipe_result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let pipe = PipeFds {
+        read_fd: pipe_fds[0],
+        write_fd: pipe_fds[1],
+    };
+    let pipe_capacity = unsafe { libc::fcntl(pipe.write_fd, libc::F_SETPIPE_SZ, total_len) };
+    if pipe_capacity < 0 || usize::try_from(pipe_capacity).unwrap_or(0) < total_len {
+        return Ok(None);
+    }
+
+    for buffer in buffers.iter().copied().filter(|buffer| !buffer.is_empty()) {
+        write_all_fd(pipe.write_fd, buffer)?;
+    }
+    for range in range_groups.iter().flat_map(|group| group.iter()) {
+        splice_all_file_to_pipe(range, pipe.write_fd)?;
+    }
+
+    let written = splice_all_pipe_to_fuse(pipe.read_fd, fuse_fd, total_len)?;
+    Ok(Some(written))
+}
+
+struct PipeFds {
+    read_fd: RawFd,
+    write_fd: RawFd,
+}
+
+impl Drop for PipeFds {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.read_fd);
+            libc::close(self.write_fd);
+        }
+    }
+}
+
+fn write_all_fd(fd: RawFd, mut data: &[u8]) -> io::Result<()> {
+    while !data.is_empty() {
+        let written = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
+        if written < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write whole FUSE reply header to splice pipe",
+            ));
+        }
+        data = &data[usize::try_from(written).unwrap_or(0)..];
+    }
+    Ok(())
+}
+
+fn splice_all_file_to_pipe(range: &FuseFileRange, pipe_write_fd: RawFd) -> io::Result<()> {
+    let mut remaining = range.len;
+    let mut offset = i64::try_from(range.offset)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    while remaining > 0 {
+        let moved = unsafe {
+            libc::splice(
+                range.fd.as_raw_fd(),
+                &mut offset,
+                pipe_write_fd,
+                std::ptr::null_mut(),
+                remaining,
+                libc::SPLICE_F_MOVE | libc::SPLICE_F_MORE,
+            )
+        };
+        if moved < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if moved == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "fd-backed FUSE reply source ended early",
+            ));
+        }
+        remaining -= usize::try_from(moved).unwrap_or(0);
+    }
+    Ok(())
+}
+
+fn splice_all_pipe_to_fuse(
+    pipe_read_fd: RawFd,
+    fuse_fd: RawFd,
+    total_len: usize,
+) -> io::Result<usize> {
+    let moved = unsafe {
+        libc::splice(
+            pipe_read_fd,
+            std::ptr::null_mut(),
+            fuse_fd,
+            std::ptr::null_mut(),
+            total_len,
+            libc::SPLICE_F_MOVE,
+        )
+    };
+    if moved < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let moved = usize::try_from(moved).unwrap_or(0);
+    if moved != total_len {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            format!("short splice to /dev/fuse: wrote {moved} of {total_len} bytes"),
+        ));
+    }
+    Ok(moved)
+}
+
+fn read_file_range_copy(range: &FuseFileRange, output: &mut Vec<u8>) -> io::Result<()> {
+    let start_len = output.len();
+    output.resize(start_len + range.len, 0);
+    let mut read = 0usize;
+    let mut offset = i64::try_from(range.offset)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    while read < range.len {
+        let dst = &mut output[start_len + read..start_len + range.len];
+        let result = unsafe {
+            libc::pread64(
+                range.fd.as_raw_fd(),
+                dst.as_mut_ptr().cast(),
+                dst.len(),
+                offset,
+            )
+        };
+        if result < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if result == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "fd-backed FUSE reply source ended early during copy fallback",
+            ));
+        }
+        let result = usize::try_from(result).unwrap_or(0);
+        read += result;
+        offset += i64::try_from(result).unwrap_or(0);
+    }
+    Ok(())
 }
 
 impl<S: BitmapSlice> Write for FuseDevWriter<'_, S> {
@@ -294,11 +577,12 @@ impl<S: BitmapSlice> Write for FuseDevWriter<'_, S> {
         self.check_available_space(data.len())?;
 
         if self.buffered {
+            self.check_no_file_ranges()?;
             self.buf.extend_from_slice(data);
             Ok(data.len())
         } else {
             Self::do_write(self.fd, data).inspect(|&x| {
-                self.account_written(x);
+                self.account_buffer_written(x);
             })
         }
     }
@@ -308,6 +592,7 @@ impl<S: BitmapSlice> Write for FuseDevWriter<'_, S> {
         self.check_available_space(bufs.iter().fold(0, |acc, x| acc + x.len()))?;
 
         if self.buffered {
+            self.check_no_file_ranges()?;
             let count = bufs.iter().filter(|b| !b.is_empty()).fold(0, |acc, b| {
                 self.buf.extend_from_slice(b);
                 acc + b.len()
@@ -319,7 +604,7 @@ impl<S: BitmapSlice> Write for FuseDevWriter<'_, S> {
             }
             writev(self.fd, bufs)
                 .inspect(|&x| {
-                    self.account_written(x);
+                    self.account_buffer_written(x);
                 })
                 .map_err(|e| {
                     error! {"fail to write to fuse device on commit: {}", e};

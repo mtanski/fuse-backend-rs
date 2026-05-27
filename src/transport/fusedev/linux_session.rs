@@ -442,7 +442,11 @@ fn fuse_kern_mount(
     // in virtiofs scene max_read can't be adjusted, his default is UINT_MAX, but we don't have to
     // worry about it, because the buffer is allocated by the kernel driver, we just use this buffer
     // to fill the response, so we don't need to do any adjustment.
-    let max_read = FUSE_KERN_BUF_PAGES * pagesize() + FUSE_HEADER_SIZE;
+    // Keep the maximum read payload below the common 1MiB Linux pipe-max-size so fd-backed
+    // read replies can be assembled in a pipe and sent to /dev/fuse with a single splice.
+    let max_read = FUSE_KERN_BUF_PAGES
+        .saturating_mul(pagesize())
+        .saturating_sub(FUSE_HEADER_SIZE);
 
     let mut opts = format!(
         "default_permissions,fd={},rootmode={:o},user_id={},group_id={},max_read={}",

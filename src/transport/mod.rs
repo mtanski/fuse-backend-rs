@@ -19,6 +19,8 @@ use std::collections::VecDeque;
 use std::io::{self, IoSlice, Read};
 use std::marker::PhantomData;
 use std::mem::{size_of, MaybeUninit};
+#[cfg(feature = "virtiofs")]
+use std::os::fd::FromRawFd;
 use std::ptr::copy_nonoverlapping;
 use std::{cmp, fmt};
 
@@ -545,6 +547,33 @@ impl<S: BitmapSlice> Writer<'_, S> {
             Writer::FuseDev(w) => w.write_from_at(src, count, off),
             #[cfg(feature = "virtiofs")]
             Writer::VirtioFs(w) => w.write_from_at(src, count, off),
+            _ => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+        }
+    }
+
+    /// Write data to the descriptor chain buffer from a raw file descriptor at offset `off`.
+    ///
+    /// FuseDev uses this to preserve fd-backed file ranges until commit, allowing the final reply
+    /// to be assembled through a pipe/splice path instead of copying resident file bytes into the
+    /// userspace reply buffer.
+    pub fn write_from_fd_at(
+        &mut self,
+        fd: std::os::fd::RawFd,
+        count: usize,
+        off: u64,
+    ) -> io::Result<usize> {
+        match self {
+            #[cfg(feature = "fusedev")]
+            Writer::FuseDev(w) => w.write_from_fd_at(fd, count, off),
+            #[cfg(feature = "virtiofs")]
+            Writer::VirtioFs(w) => {
+                let dup_fd = unsafe { libc::dup(fd) };
+                if dup_fd < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
+                w.write_from_at(file, count, off)
+            }
             _ => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
         }
     }

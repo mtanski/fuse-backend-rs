@@ -97,6 +97,15 @@ impl<S: BitmapSlice> ZeroCopyWriter for ZcWriter<'_, S> {
         self.0.write_from_at(f, count, off)
     }
 
+    fn write_from_fd_at(
+        &mut self,
+        fd: std::os::fd::RawFd,
+        count: usize,
+        off: u64,
+    ) -> io::Result<usize> {
+        self.0.write_from_fd_at(fd, count, off)
+    }
+
     fn available_bytes(&self) -> usize {
         self.0.available_bytes()
     }

@@ -9,7 +9,9 @@
 //! and the backend filesystem server. Other structs are used to pass information from the
 
 use std::convert::TryInto;
+use std::fs::File;
 use std::io;
+use std::os::fd::{FromRawFd, RawFd};
 use std::time::Duration;
 
 use crate::abi::fuse_abi as fuse;
@@ -304,6 +306,21 @@ pub trait ZeroCopyWriter: io::Write {
         count: usize,
         off: u64,
     ) -> io::Result<usize>;
+
+    /// Copies at most `count` bytes from `fd` at offset `off` directly into `self`.
+    ///
+    /// Transports that can move file ranges without first copying them into an intermediate
+    /// userspace buffer should override this method. The default implementation duplicates the
+    /// file descriptor and falls back to `write_from`, preserving correctness for transports that
+    /// only implement the original buffer-backed path.
+    fn write_from_fd_at(&mut self, fd: RawFd, count: usize, off: u64) -> io::Result<usize> {
+        let dup_fd = unsafe { libc::dup(fd) };
+        if dup_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut file = unsafe { File::from_raw_fd(dup_fd) };
+        self.write_from(&mut file, count, off)
+    }
 
     /// Copies exactly `count` bytes of data from `f` at offset `off` into `self`. `off + count`
     /// must be less than `u64::MAX`.
