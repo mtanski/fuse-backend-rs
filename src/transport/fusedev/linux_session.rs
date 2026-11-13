@@ -47,6 +47,7 @@ pub struct FuseSession {
     fsname: String,
     subtype: String,
     file: Option<File>,
+    manages_mount: bool,
     // Socket to keep alive / drop for fusermount's auto_unmount.
     keep_alive: Option<UnixStream>,
     bufsize: usize,
@@ -90,11 +91,41 @@ impl FuseSession {
             fsname: fsname.to_owned(),
             subtype: subtype.to_owned(),
             file: None,
+            manages_mount: true,
             keep_alive: None,
             bufsize: FUSE_KERN_BUF_PAGES * pagesize() + FUSE_HEADER_SIZE,
             readonly,
             wakers: Mutex::new(Vec::new()),
             auto_unmount,
+            target_mntns: None,
+            fusermount: FUSERMOUNT_BIN.to_string(),
+            allow_other: true,
+        })
+    }
+
+    /// Take ownership of an open FUSE file without managing its mount.
+    ///
+    /// This does not access the mountpoint or open `/dev/fuse`. The file is made nonblocking,
+    /// preserving its other flags. This also affects descriptors sharing its open file description.
+    /// The caller remains responsible for unmounting. Dropping the session closes its file.
+    pub fn from_file(file: File) -> Result<Self> {
+        let flags = fcntl(file.as_raw_fd(), FcntlArg::F_GETFL)
+            .map_err(|e| SessionFailure(format!("get fd flags: {e}")))?;
+        let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
+        fcntl(file.as_raw_fd(), FcntlArg::F_SETFL(flags))
+            .map_err(|e| SessionFailure(format!("set fd nonblocking: {e}")))?;
+
+        Ok(FuseSession {
+            mountpoint: PathBuf::new(),
+            fsname: String::new(),
+            subtype: String::new(),
+            file: Some(file),
+            manages_mount: false,
+            keep_alive: None,
+            bufsize: FUSE_KERN_BUF_PAGES * pagesize() + FUSE_HEADER_SIZE,
+            readonly: false,
+            wakers: Mutex::new(Vec::new()),
+            auto_unmount: false,
             target_mntns: None,
             fusermount: FUSERMOUNT_BIN.to_string(),
             allow_other: true,
@@ -164,6 +195,8 @@ impl FuseSession {
     }
 
     /// Get the mountpoint of the session.
+    ///
+    /// Returns an empty path for sessions created with [`Self::from_file`].
     pub fn mountpoint(&self) -> &Path {
         &self.mountpoint
     }
@@ -185,6 +218,12 @@ impl FuseSession {
 
     /// Mount the fuse mountpoint, building connection with the in kernel fuse driver.
     pub fn mount(&mut self) -> Result<()> {
+        if !self.manages_mount {
+            return Err(SessionFailure(
+                "session does not manage the mount".to_string(),
+            ));
+        }
+
         let mut flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOATIME;
         if self.readonly {
             flags |= MsFlags::MS_RDONLY;
@@ -210,6 +249,12 @@ impl FuseSession {
 
     /// Destroy a fuse session.
     pub fn umount(&mut self) -> Result<()> {
+        if !self.manages_mount {
+            return Err(SessionFailure(
+                "session does not manage the mount".to_string(),
+            ));
+        }
+
         // If we have a keep_alive socket, just drop it,
         // and let fusermount do the unmount.
         if let (None, Some(file)) = (self.keep_alive.take(), self.file.take()) {
@@ -265,7 +310,9 @@ impl FuseSession {
 
 impl Drop for FuseSession {
     fn drop(&mut self) {
-        let _ = self.umount();
+        if self.manages_mount {
+            let _ = self.umount();
+        }
     }
 }
 
